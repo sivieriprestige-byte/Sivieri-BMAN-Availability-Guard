@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Sivieri BMAN Availability Guard
- * Description: Gestione leggera della visibilità prodotti/varianti WooCommerce dopo sincronizzazione BMAN. Nasconde automaticamente varianti esaurite, ripubblica al rientro stock e protegge esclusioni manuali per SKU, filtra gli swatches e seleziona automaticamente l’unica variante disponibile.
- * Version: 1.0.2
+ * Description: Gestione leggera della visibilità prodotti/varianti WooCommerce dopo sincronizzazione BMAN. Nasconde automaticamente varianti esaurite, filtra in tempo reale colore e taglia e richiede tutte le opzioni prima dell'acquisto.
+ * Version: 1.1.0
  * Author: Sivieri Prestige
  * Requires Plugins: woocommerce
  * Text Domain: sivieri-bman-availability-guard
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 	final class SP_BMAN_Availability_Guard {
 
-		const VERSION = '1.0.2';
+		const VERSION = '1.1.0';
 
 		const PRODUCT_MODE_META   = '_spbag_product_mode';
 		const VARIATION_MODE_META = '_spbag_variation_mode';
@@ -72,8 +72,9 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 			add_filter( 'woocommerce_get_children', array( __CLASS__, 'filter_product_children' ), 30, 3 );
 			add_filter( 'woocommerce_dropdown_variation_attribute_options_args', array( __CLASS__, 'filter_dropdown_variation_attribute_options_args' ), 40, 1 );
 			add_filter( 'woocommerce_product_get_default_attributes', array( __CLASS__, 'filter_default_attributes' ), 40, 2 );
+			add_filter( 'woocommerce_add_to_cart_validation', array( __CLASS__, 'validate_required_variation_attributes' ), 30, 6 );
 			add_action( 'wp_head', array( __CLASS__, 'print_frontend_swatch_css' ), 20 );
-			add_action( 'wp_footer', array( __CLASS__, 'print_auto_select_single_visible_variation_script' ), 30 );
+			add_action( 'wp_footer', array( __CLASS__, 'print_frontend_variation_selection_script' ), 30 );
 		}
 
 		public static function activate() {
@@ -1084,6 +1085,97 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 			return $clean_defaults;
 		}
 
+		/**
+		 * WooCommerce normalmente valida le selezioni, ma alcune integrazioni di
+		 * swatches/gestionali possono inviare una variation_id pur senza tutti gli
+		 * attributi. La verifica lato server resta quindi la protezione definitiva.
+		 */
+		public static function validate_required_variation_attributes( $passed, $product_id, $quantity, $variation_id = 0, $variations = array(), $cart_item_data = array() ) {
+			if ( ! $passed ) {
+				return false;
+			}
+
+			$product = wc_get_product( $product_id );
+
+			if ( ! $product instanceof WC_Product || ! $product->is_type( 'variable' ) ) {
+				return $passed;
+			}
+
+			$missing = array();
+
+			foreach ( (array) $product->get_variation_attributes() as $attribute_name => $options ) {
+				$field_name = 'attribute_' . $attribute_name;
+				$value      = isset( $variations[ $field_name ] ) ? $variations[ $field_name ] : '';
+
+				if ( '' === (string) $value && isset( $_REQUEST[ $field_name ] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+					$value = wc_clean( wp_unslash( $_REQUEST[ $field_name ] ) ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+				}
+
+				if ( '' === (string) $value ) {
+					$missing[] = wc_attribute_label( $attribute_name, $product );
+				}
+			}
+
+			if ( ! empty( $missing ) ) {
+				wc_add_notice(
+					sprintf(
+						'Seleziona %s prima di aggiungere il prodotto al carrello.',
+						implode( ' e ', array_map( 'wp_strip_all_tags', $missing ) )
+					),
+					'error'
+				);
+
+				return false;
+			}
+
+			if ( $variation_id ) {
+				$variation = wc_get_product( $variation_id );
+
+				if ( $variation instanceof WC_Product_Variation && ! self::should_variation_be_frontend_visible( $variation ) ) {
+					wc_add_notice( 'La combinazione selezionata non è più disponibile. Scegli un’altra opzione.', 'error' );
+					return false;
+				}
+			}
+
+			return $passed;
+		}
+
+		/**
+		 * Dati compatti per il filtro lato browser. Sono presenti anche quando
+		 * WooCommerce passa alle variazioni via AJAX (cataloghi oltre la soglia).
+		 */
+		private static function frontend_variation_selection_data( $product ) {
+			if ( ! $product instanceof WC_Product || ! $product->is_type( 'variable' ) ) {
+				return array();
+			}
+
+			$data = array();
+
+			foreach ( self::get_visible_variation_ids( $product->get_id() ) as $variation_id ) {
+				$variation = wc_get_product( $variation_id );
+
+				if ( ! $variation instanceof WC_Product_Variation || ! self::should_variation_be_frontend_visible( $variation ) ) {
+					continue;
+				}
+
+				$attributes = array();
+				foreach ( (array) $variation->get_attributes() as $attribute => $value ) {
+					$name = 0 === strpos( (string) $attribute, 'attribute_' ) ? (string) $attribute : 'attribute_' . $attribute;
+					$attributes[ $name ] = (string) $value;
+				}
+
+				$data[] = array(
+					'variation_id'         => $variation->get_id(),
+					'attributes'           => $attributes,
+					'variation_is_active'  => true,
+					'is_purchasable'       => $variation->is_purchasable(),
+					'is_in_stock'          => $variation->is_in_stock(),
+				);
+			}
+
+			return $data;
+		}
+
 		public static function print_frontend_swatch_css() {
 			if ( is_admin() || ! ( function_exists( 'is_product' ) && is_product() || function_exists( 'is_shop' ) && is_shop() || function_exists( 'is_product_category' ) && is_product_category() || function_exists( 'is_product_tag' ) && is_product_tag() || is_tax() ) ) {
 				return;
@@ -1100,6 +1192,8 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 				.variations_form .rtwpvs-term.out-of-stock,
 				.variations_form [aria-disabled="true"].cfvsw-swatches-option,
 				.variations_form [aria-disabled="true"].variable-item,
+				.variations_form .spbag-hidden,
+				.variations_form [data-spbag-hidden="1"],
 				.sp-loop-color-swatches .disabled,
 				.sp-loop-color-swatches .out-of-stock,
 				.sp-loop-color-swatches .is-disabled,
@@ -1114,18 +1208,42 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 				.sp-loop-swatches [data-spbag-hidden="1"] {
 					display: none !important;
 				}
+
+				.variations_form .spbag-selection-note {
+					display: block;
+					margin: 10px 0 0;
+					color: rgba(38, 28, 21, .72);
+					font-size: 13px;
+					line-height: 1.35;
+				}
+
+				.variations_form .spbag-selection-note[hidden] {
+					display: none !important;
+				}
 			</style>
 			<?php
 		}
 
-		public static function print_auto_select_single_visible_variation_script() {
+		public static function print_frontend_variation_selection_script() {
 			if ( is_admin() || ! ( function_exists( 'is_product' ) && is_product() ) ) {
 				return;
 			}
+
+			global $product;
+			if ( ! $product instanceof WC_Product ) {
+				$product = wc_get_product( get_queried_object_id() );
+			}
+
+			$selection_data = self::frontend_variation_selection_data( $product );
 			?>
-			<script id="spbag-auto-select-single-visible-variation">
+			<script id="spbag-variation-selection-guard">
 				(function () {
 					'use strict';
+					var serverVariations = <?php echo wp_json_encode( $selection_data ); ?>;
+
+					function selectsFor(form) {
+						return Array.prototype.slice.call(form.querySelectorAll('select[name^="attribute_"]'));
+					}
 
 					function getSelectableOptions(select) {
 						return Array.prototype.slice.call(select.options || []).filter(function (option) {
@@ -1133,68 +1251,258 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 						});
 					}
 
-					function dispatchNativeChange(select) {
-						select.dispatchEvent(new Event('change', { bubbles: true }));
+					function variationIsUsable(variation) {
+						return !!(
+							variation && variation.variation_id && variation.variation_is_active !== false &&
+							variation.is_purchasable !== false && variation.is_in_stock !== false
+						);
 					}
 
-					function autoSelectSingleOptions(form) {
-						if (!form) return;
+					function formVariations(form) {
+						var variations = window.jQuery ? window.jQuery(form).data('product_variations') : [];
+						return Array.isArray(variations) && variations.length ? variations : serverVariations;
+					}
 
-						var selects = Array.prototype.slice.call(form.querySelectorAll('select[name^="attribute_"]'));
+					function selectedValues(form) {
+						var values = {};
+						selectsFor(form).forEach(function (select) {
+							values[select.name] = select.value || '';
+						});
+						return values;
+					}
+
+					function variationMatches(variation, values, candidateName, candidateValue) {
+						if (!variationIsUsable(variation)) return false;
+						var attributes = variation.attributes || {};
+
+						return Object.keys(values).every(function (name) {
+							var selected = name === candidateName ? candidateValue : values[name];
+							var expected = attributes[name] || '';
+
+							// Un valore vuoto nella variante WooCommerce significa "qualsiasi".
+							return !selected || !expected || expected === selected;
+						});
+					}
+
+					function optionForValue(select, value) {
+						return Array.prototype.slice.call(select.options || []).filter(function (option) {
+							return option.value === value;
+						})[0] || null;
+					}
+
+					function optionValueForSwatch(swatch) {
+						return swatch.getAttribute('data-value') || swatch.getAttribute('data-term') ||
+							swatch.getAttribute('data-slug') || swatch.getAttribute('data-attribute_value') || '';
+					}
+
+					function syncSwatches(select) {
+						var scope = select.closest('tr, .value, .variations') || select.parentNode;
+						if (!scope) return;
+
+						Array.prototype.slice.call(scope.querySelectorAll('[data-value], [data-term], [data-slug], [data-attribute_value]')).forEach(function (swatch) {
+							var value = optionValueForSwatch(swatch);
+							if (!value) return;
+
+							var option = optionForValue(select, value);
+							var hidden = !option || option.disabled || option.hidden;
+							swatch.classList.toggle('spbag-hidden', hidden);
+							swatch.setAttribute('data-spbag-hidden', hidden ? '1' : '0');
+							if (hidden) swatch.setAttribute('aria-hidden', 'true');
+							else swatch.removeAttribute('aria-hidden');
+						});
+					}
+
+					function selectionIsComplete(form) {
+						var selects = selectsFor(form);
+						return selects.length > 0 && selects.every(function (select) {
+							var option = optionForValue(select, select.value || '');
+							return !!(select.value && option && !option.disabled && !option.hidden);
+						});
+					}
+
+					function ensureNote(form) {
+						var note = form.querySelector('.spbag-selection-note');
+						if (note) return note;
+
+						note = document.createElement('p');
+						note.className = 'spbag-selection-note';
+						note.setAttribute('aria-live', 'polite');
+						note.textContent = 'Seleziona tutte le opzioni disponibili per continuare.';
+						var target = form.querySelector('.woocommerce-variation-add-to-cart') || form;
+						target.appendChild(note);
+						return note;
+					}
+
+					function updatePurchaseState(form) {
+						var complete = selectionIsComplete(form);
+						var button = form.querySelector('.single_add_to_cart_button');
+						var note = ensureNote(form);
+
+						note.hidden = complete;
+						if (!button) return complete;
+
+						button.disabled = !complete;
+						button.classList.toggle('disabled', !complete);
+						button.setAttribute('aria-disabled', complete ? 'false' : 'true');
+						return complete;
+					}
+
+					function syncAvailability(form) {
+						if (!form || form.dataset.spbagSyncing === '1') return;
+
+						var variations = formVariations(form);
+						var selects = selectsFor(form);
+						if (!selects.length) return;
+						if (!variations.length) {
+							updatePurchaseState(form);
+							return;
+						}
+
+						form.dataset.spbagSyncing = '1';
+						var values = selectedValues(form);
 						var changed = false;
 
-						if (!selects.length) return;
-
 						selects.forEach(function (select) {
-							var options;
+							Array.prototype.slice.call(select.options || []).forEach(function (option) {
+								if (!option.value) return;
 
-							if (select.value) {
-								return;
-							}
+								var usable = variations.some(function (variation) {
+									return variationMatches(variation, values, select.name, option.value);
+								});
 
-							options = getSelectableOptions(select);
-
-							if (options.length === 1) {
-								select.value = options[0].value;
-								changed = true;
-							}
-						});
-
-						if (!changed) return;
-
-						if (window.jQuery) {
-							var $form = window.jQuery(form);
-
-							selects.forEach(function (select) {
-								window.jQuery(select).trigger('change');
+								option.hidden = !usable;
+								option.disabled = !usable;
+								option.setAttribute('data-spbag-hidden', usable ? '0' : '1');
 							});
 
-							$form.trigger('woocommerce_variation_select_change');
+							if (select.value) {
+								var selectedOption = optionForValue(select, select.value);
+								if (!selectedOption || selectedOption.disabled || selectedOption.hidden) {
+									select.value = '';
+									values[select.name] = '';
+									changed = true;
+								}
+							}
+
+							syncSwatches(select);
+						});
+
+						form.dataset.spbagSyncing = '0';
+						updatePurchaseState(form);
+
+						if (changed && window.jQuery) {
+							var $form = window.jQuery(form);
+							$form.find('select[name^="attribute_"]').trigger('change');
 							$form.trigger('check_variations');
-						} else {
-							selects.forEach(dispatchNativeChange);
 						}
 					}
 
-					function runAutoSelect() {
-						document.querySelectorAll('form.variations_form').forEach(autoSelectSingleOptions);
+					function autoSelectSingleOptions(form) {
+						var selects = selectsFor(form);
+
+						// Con due o più attributi non imponiamo mai una combinazione: colore,
+						// taglia e simili devono essere scelti esplicitamente dal cliente.
+						if (selects.length !== 1) return;
+
+						var select = selects[0];
+						if (select.value) return;
+
+						var options = getSelectableOptions(select);
+						if (options.length !== 1) return;
+
+						select.value = options[0].value;
+						if (window.jQuery) {
+							var $form = window.jQuery(form);
+							window.jQuery(select).trigger('change');
+							$form.trigger('woocommerce_variation_select_change');
+							$form.trigger('check_variations');
+						} else {
+							select.dispatchEvent(new Event('change', { bubbles: true }));
+						}
+					}
+
+					function clearInitialMultiAttributeDefaults(form) {
+						var selects = selectsFor(form);
+						if (form.dataset.spbagInitialised === '1' || selects.length < 2) return;
+						form.dataset.spbagInitialised = '1';
+
+						var changed = false;
+						selects.forEach(function (select) {
+							if (!select.value) return;
+							select.value = '';
+							changed = true;
+						});
+
+						if (changed && window.jQuery) {
+							var $form = window.jQuery(form);
+							$form.find('select[name^="attribute_"]').trigger('change');
+							$form.trigger('reset_data');
+							$form.trigger('check_variations');
+						}
+					}
+
+					function queueSync(form) {
+						window.clearTimeout(form._spbagSyncTimer);
+						form._spbagSyncTimer = window.setTimeout(function () {
+							syncAvailability(form);
+							autoSelectSingleOptions(form);
+							updatePurchaseState(form);
+						}, 20);
+					}
+
+					function bindForm(form) {
+						if (!form || form.dataset.spbagBound === '1') return;
+						form.dataset.spbagBound = '1';
+
+						clearInitialMultiAttributeDefaults(form);
+						queueSync(form);
+
+						form.addEventListener('submit', function (event) {
+							if (updatePurchaseState(form)) return;
+
+							event.preventDefault();
+							event.stopImmediatePropagation();
+							var firstMissing = selectsFor(form).filter(function (select) {
+								return !select.value;
+							})[0];
+							if (firstMissing && typeof firstMissing.focus === 'function') firstMissing.focus();
+						}, true);
+
+						if (window.jQuery) {
+							window.jQuery(form).on(
+								'wc_variation_form.spbag woocommerce_update_variation_values.spbag found_variation.spbag reset_data.spbag hide_variation.spbag change.spbag',
+								'select[name^="attribute_"]',
+								function () { queueSync(form); }
+							);
+							window.jQuery(form).on(
+								'wc_variation_form.spbag woocommerce_update_variation_values.spbag found_variation.spbag reset_data.spbag hide_variation.spbag',
+								function () { queueSync(form); }
+							);
+						}
+					}
+
+					function bindAll(context) {
+						var scope = context || document;
+						if (scope.matches && scope.matches('form.variations_form')) bindForm(scope);
+						scope.querySelectorAll('form.variations_form').forEach(bindForm);
 					}
 
 					if (document.readyState === 'loading') {
-						document.addEventListener('DOMContentLoaded', runAutoSelect);
+						document.addEventListener('DOMContentLoaded', function () { bindAll(document); });
 					} else {
-						runAutoSelect();
+						bindAll(document);
 					}
 
-					setTimeout(runAutoSelect, 120);
+					window.setTimeout(function () { bindAll(document); }, 160);
 
-					if (window.jQuery) {
-						window.jQuery(function ($) {
-							$('form.variations_form')
-								.on('wc_variation_form woocommerce_update_variation_values', function () {
-									autoSelectSingleOptions(this);
+					if ('MutationObserver' in window) {
+						new MutationObserver(function (records) {
+							records.forEach(function (record) {
+								Array.prototype.forEach.call(record.addedNodes || [], function (node) {
+									if (node.nodeType === 1) bindAll(node);
 								});
-						});
+							});
+						}).observe(document.body, { childList: true, subtree: true });
 					}
 				})();
 			</script>
