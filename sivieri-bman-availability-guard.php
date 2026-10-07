@@ -1998,3 +1998,174 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 					}
 
 					function ensureNote(form) {
+						var note = form.querySelector('.spbag-selection-note');
+						if (note) return note;
+
+						note = document.createElement('p');
+						note.className = 'spbag-selection-note';
+						note.setAttribute('aria-live', 'polite');
+						note.textContent = 'Seleziona tutte le opzioni disponibili per continuare.';
+						var target = form.querySelector('.woocommerce-variation-add-to-cart') || form;
+						target.appendChild(note);
+						return note;
+					}
+
+					function updatePurchaseState(form) {
+						var complete = selectionIsComplete(form);
+						var button = form.querySelector('.single_add_to_cart_button');
+						var note = ensureNote(form);
+
+						note.hidden = complete;
+						updateFreeShippingNotice(form);
+						if (!button) return complete;
+
+						button.disabled = !complete;
+						button.classList.toggle('disabled', !complete);
+						button.setAttribute('aria-disabled', complete ? 'false' : 'true');
+						return complete;
+					}
+
+					function syncAvailability(form) {
+						if (!form || form.dataset.spbagSyncing === '1') return;
+
+						var variations = formVariations(form);
+						var selects = selectsFor(form);
+						if (!selects.length) return;
+						if (!variations.length) {
+							updatePurchaseState(form);
+							return;
+						}
+
+						form.dataset.spbagSyncing = '1';
+						var values = selectedValues(form);
+						var changed = false;
+
+						selects.forEach(function (select) {
+							Array.prototype.slice.call(select.options || []).forEach(function (option) {
+								if (!option.value) return;
+
+								var usable = variations.some(function (variation) {
+									return variationMatches(variation, values, select.name, option.value);
+								});
+
+								option.hidden = !usable;
+								option.disabled = !usable;
+								option.setAttribute('data-spbag-hidden', usable ? '0' : '1');
+							});
+
+							if (select.value) {
+								var selectedOption = optionForValue(select, select.value);
+								if (!selectedOption || selectedOption.disabled || selectedOption.hidden) {
+									select.value = '';
+									values[select.name] = '';
+									changed = true;
+								}
+							}
+
+							syncSwatches(select);
+						});
+
+						form.dataset.spbagSyncing = '0';
+						updatePurchaseState(form);
+
+						if (changed && window.jQuery) {
+							var $form = window.jQuery(form);
+							$form.find('select[name^="attribute_"]').trigger('change');
+							$form.trigger('check_variations');
+						}
+					}
+
+					function queueSync(form) {
+						window.clearTimeout(form._spbagSyncTimer);
+						form._spbagSyncTimer = window.setTimeout(function () {
+							suggestInitialAvailableCombination(form);
+							syncAvailability(form);
+							updatePurchaseState(form);
+						}, 20);
+					}
+
+					function bindForm(form) {
+						if (!form || form.dataset.spbagBound === '1') return;
+						form.dataset.spbagBound = '1';
+
+						queueSync(form);
+
+						form.addEventListener('submit', function (event) {
+							if (updatePurchaseState(form)) return;
+
+							event.preventDefault();
+							event.stopImmediatePropagation();
+							var firstMissing = selectsFor(form).filter(function (select) {
+								return !select.value;
+							})[0];
+							if (firstMissing && typeof firstMissing.focus === 'function') firstMissing.focus();
+						}, true);
+
+						if (window.jQuery) {
+							window.jQuery(form).on(
+								'wc_variation_form.spbag woocommerce_update_variation_values.spbag found_variation.spbag reset_data.spbag hide_variation.spbag change.spbag',
+								'select[name^="attribute_"]',
+								function () { queueSync(form); }
+							);
+							window.jQuery(form).on(
+								'wc_variation_form.spbag woocommerce_update_variation_values.spbag found_variation.spbag reset_data.spbag hide_variation.spbag',
+								function () { queueSync(form); }
+							);
+						}
+					}
+
+					function bindAll(context) {
+						var scope = context || document;
+						if (scope.matches && scope.matches('form.variations_form')) bindForm(scope);
+						scope.querySelectorAll('form.variations_form').forEach(bindForm);
+					}
+
+					function bindSimpleFreeShippingNotices(context) {
+						var data = freeShippingData();
+						if (!data.enabled || data.variable) return;
+
+						var scope = context || document;
+						if (scope.matches && scope.matches('.single_add_to_cart_button')) updateFreeShippingNotice(null, scope);
+						scope.querySelectorAll('.single_add_to_cart_button').forEach(function (button) {
+							updateFreeShippingNotice(null, button);
+						});
+					}
+
+					if (document.readyState === 'loading') {
+						document.addEventListener('DOMContentLoaded', function () {
+							bindAll(document);
+							bindSimpleFreeShippingNotices(document);
+						});
+					} else {
+						bindAll(document);
+						bindSimpleFreeShippingNotices(document);
+					}
+
+					window.setTimeout(function () {
+						bindAll(document);
+						bindSimpleFreeShippingNotices(document);
+					}, 160);
+
+					if ('MutationObserver' in window) {
+						new MutationObserver(function (records) {
+							records.forEach(function (record) {
+								Array.prototype.forEach.call(record.addedNodes || [], function (node) {
+									if (node.nodeType === 1) {
+										bindAll(node);
+										bindSimpleFreeShippingNotices(node);
+									}
+								});
+							});
+						}).observe(document.body, { childList: true, subtree: true });
+					}
+				})();
+			</script>
+			<?php
+		}
+	}
+}
+
+SP_BMAN_Availability_Guard::init();
+
+register_activation_hook( __FILE__, array( 'SP_BMAN_Availability_Guard', 'activate' ) );
+register_deactivation_hook( __FILE__, array( 'SP_BMAN_Availability_Guard', 'deactivate' ) );
