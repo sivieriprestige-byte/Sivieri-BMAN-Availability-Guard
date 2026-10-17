@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Sivieri BMAN Availability Guard
  * Description: Gestione leggera della visibilità prodotti/varianti WooCommerce dopo sincronizzazione BMAN. Nasconde automaticamente varianti esaurite, propone una combinazione valida e aggiorna le informazioni d'acquisto in tempo reale.
- * Version: 1.4.0
+ * Version: 1.6.2
  * Author: Sivieri Prestige
  * Requires Plugins: woocommerce
  * Text Domain: sivieri-bman-availability-guard
@@ -15,7 +15,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 	final class SP_BMAN_Availability_Guard {
 
-		const VERSION = '1.4.0';
+		const VERSION = '1.6.2';
+
+		const EDITORIAL_TITLE_META = '_spbag_editorial_title';
+		private static $editorial_title_updates = array();
 
 		const PRODUCT_MODE_META   = '_spbag_product_mode';
 		const VARIATION_MODE_META = '_spbag_variation_mode';
@@ -44,6 +47,10 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 		private static $reconciling_updates = false;
 		private static $pending_new_product_guard = false;
 
+		// 1.5.0 — protezione stato prodotto pubblicato/esaurito.
+		private static $trashed_variation_restore_queue = array();
+		private static $outofstock_price_cache = array();
+
 		public static function init() {
 			add_action( 'plugins_loaded', array( __CLASS__, 'boot' ), 20 );
 		}
@@ -62,6 +69,19 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 			add_filter( 'wp_insert_post_data', array( __CLASS__, 'guard_new_product_before_insert' ), 5, 4 );
 			add_action( 'wp_after_insert_post', array( __CLASS__, 'mark_guarded_new_product_after_insert' ), 5, 4 );
 			add_action( 'transition_post_status', array( __CLASS__, 'unlock_guarded_product_on_manual_publish' ), 5, 3 );
+
+			// 1.6.0 — preserve only names intentionally edited by the boutique.
+			add_filter( 'woocommerce_rest_pre_insert_product_object', array( __CLASS__, 'allow_editorial_rest_title' ), 90, 3 );
+			add_action( 'woocommerce_before_product_object_save', array( __CLASS__, 'protect_editorial_product_name' ), 99, 1 );
+			add_filter( 'wp_insert_post_data', array( __CLASS__, 'protect_editorial_post_title' ), 99, 4 );
+			add_action( 'wp_after_insert_post', array( __CLASS__, 'remember_manual_product_title' ), 99, 4 );
+			add_action( 'woocommerce_admin_process_product_object', array( __CLASS__, 'remember_admin_product_name' ), 99, 1 );
+			add_action( 'woocommerce_after_product_object_save', array( __CLASS__, 'clear_editorial_title_update' ), 99, 1 );
+			add_action( 'woocommerce_product_options_general_product_data', array( __CLASS__, 'render_editorial_title_status' ) );
+
+			// 1.5.0 — una variante esaurita di un parent pubblicato non deve finire nel cestino.
+			add_action( 'transition_post_status', array( __CLASS__, 'queue_trashed_variation_restore' ), 20, 3 );
+			add_action( 'shutdown', array( __CLASS__, 'restore_protected_trashed_variations' ), 98 );
 
 			// Admin UI.
 			add_action( 'admin_menu', array( __CLASS__, 'admin_menu' ) );
@@ -89,6 +109,22 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 			add_action( 'woocommerce_update_product_variation', array( __CLASS__, 'on_product_updated' ), 30, 1 );
 			// Reconcile once, after WooCommerce has persisted stock and cleared its caches.
 			add_action( 'shutdown', array( __CLASS__, 'reconcile_product_updates' ), 99 );
+
+			// 1.5.x — conserva il prezzo reale delle schede pubblicate ma esaurite.
+			add_filter( 'woocommerce_product_get_price', array( __CLASS__, 'filter_outofstock_parent_price' ), 99, 2 );
+			add_filter( 'woocommerce_product_get_regular_price', array( __CLASS__, 'filter_outofstock_parent_price' ), 99, 2 );
+			add_filter( 'woocommerce_get_price_html', array( __CLASS__, 'filter_outofstock_price_html' ), 99, 2 );
+
+			// 1.5.1 — integra il prezzo storico anche nei metadati Rank Math/Slack.
+			add_filter( 'rank_math/opengraph/slack_enhanced_data', array( __CLASS__, 'filter_rank_math_slack_enhanced_data' ), 99, 1 );
+
+			// 1.5.1 — prepara l'Offer SASWP degli esauriti prima del filtro SEO globale (priority 99).
+			add_filter( 'saswp_modify_schema_output', array( __CLASS__, 'filter_saswp_outofstock_schema' ), 90, 1 );
+
+			// 1.5.0 — vista amministrativa unificata “Pubblicato · Esaurito”.
+			add_filter( 'display_post_states', array( __CLASS__, 'add_published_outofstock_post_state' ), 20, 2 );
+			add_action( 'restrict_manage_posts', array( __CLASS__, 'render_published_outofstock_filter' ) );
+			add_action( 'pre_get_posts', array( __CLASS__, 'apply_published_outofstock_filter' ) );
 
 			// Safety net after import/sync: background scans, not frontend scans.
 			add_action( self::CRON_HOURLY, array( __CLASS__, 'start_background_scan' ) );
@@ -183,8 +219,9 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 				<h2>Regole attive</h2>
 				<ul style="list-style:disc;margin-left:20px;max-width:920px;">
 					<li><strong>Prodotti già pubblicati in AUTO:</strong> se disponibili restano normalmente visibili; se completamente esauriti restano <strong>pubblicati</strong> per conservare URL e valore SEO, ma vengono nascosti da catalogo, categorie e ricerca interna.</li>
+					<li><strong>Pubblicato · Esaurito:</strong> la scheda resta raggiungibile e indicizzabile, il prezzo storico resta leggibile e l’ultima variante a stock 0 viene conservata come non visibile invece di essere persa nel cestino.</li>
 					<li><strong>Esauriti da verificare:</strong> il primo esaurimento registra una data e inserisce automaticamente il prodotto nella coda di controllo. Se lo stock torna disponibile, il prodotto esce dalla coda e torna visibile senza interventi manuali.</li>
-					<li><strong>Varianti in AUTO:</strong> stock maggiore di 0 → visibile; esaurita → nascosta automaticamente.</li>
+					<li><strong>Varianti in AUTO:</strong> stock maggiore di 0 → visibile; esaurita → nascosta automaticamente come privata, senza cancellarla.</li>
 					<li><strong>Swatches colore/taglia:</strong> le varianti non visibili vengono filtrate dalla scheda prodotto e nascoste nei loop quando i plugin usano classi standard di non disponibilità.</li>
 					<li><strong>Combinazione proposta:</strong> nei prodotti in AUTO viene proposta all'apertura una combinazione completa e disponibile; se il default WooCommerce non è acquistabile, viene scelta la prima disponibile.</li>
 					<li><strong>Spedizione gratuita:</strong> nella scheda compare automaticamente quando il prezzo effettivo della combinazione supera la soglia impostata per Sivieri Prestige.</li>
@@ -846,6 +883,100 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 		 * 1.3.0 — Nuovi prodotti BMAN sempre in bozza PRIMA della pubblicazione
 		 * ------------------------------------------------------------------ */
 
+		/** Editorial title only: never filters stock, prices, variations or SEO fields. */
+		private static function is_manual_title_edit( $product_id ) {
+			if ( ! is_admin() || self::is_external_sync_request() || wp_doing_cron() || ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) || ! current_user_can( 'edit_post', $product_id ) ) {
+				return false;
+			}
+			$nonce = isset( $_POST['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_POST['_wpnonce'] ) ) : '';
+			$inline = isset( $_POST['_inline_edit'] ) ? sanitize_text_field( wp_unslash( $_POST['_inline_edit'] ) ) : '';
+			return ( $nonce && wp_verify_nonce( $nonce, 'update-post_' . $product_id ) ) || ( $inline && wp_verify_nonce( $inline, 'inlineeditnonce' ) );
+		}
+
+		public static function allow_editorial_rest_title( $product, $request, $creating ) {
+			if ( $creating || ! $product instanceof WC_Product || $product->is_type( 'variation' ) || ! $product->get_id() ) {
+				return $product;
+			}
+			// Explicit opt-in for editorial API tools; an ordinary BMAN payload has no opt-in.
+			if ( true === $request->get_param( 'spbag_title_edit' ) && current_user_can( 'edit_post', $product->get_id() ) && null !== $request->get_param( 'name' ) ) {
+				// The REST controller supplies a slashed name; editorial metadata stores plain text.
+				$title = wp_unslash( (string) $product->get_name( 'edit' ) );
+				if ( '' !== trim( $title ) ) {
+					self::$editorial_title_updates[ $product->get_id() ] = $title;
+					$product->update_meta_data( self::EDITORIAL_TITLE_META, $title );
+				}
+			}
+			return $product;
+		}
+
+		public static function protect_editorial_product_name( $product ) {
+			if ( ! $product instanceof WC_Product || $product->is_type( 'variation' ) || ! $product->get_id() ) {
+				return;
+			}
+			$id = $product->get_id();
+			if ( self::is_manual_title_edit( $id ) || ( isset( self::$editorial_title_updates[ $id ] ) && self::$editorial_title_updates[ $id ] === wp_unslash( (string) $product->get_name( 'edit' ) ) ) ) {
+				return;
+			}
+			$title = (string) get_post_meta( $id, self::EDITORIAL_TITLE_META, true );
+			if ( '' !== $title ) {
+				$product->set_name( $title );
+				$product->update_meta_data( self::EDITORIAL_TITLE_META, $title );
+			}
+		}
+
+		public static function protect_editorial_post_title( $data, $postarr, $unsanitized_postarr, $update ) {
+			if ( ! $update || 'product' !== ( $data['post_type'] ?? '' ) ) {
+				return $data;
+			}
+			$id = absint( $postarr['ID'] ?? ( $unsanitized_postarr['ID'] ?? 0 ) );
+			if ( ! $id || self::is_manual_title_edit( $id ) || ( isset( self::$editorial_title_updates[ $id ] ) && self::$editorial_title_updates[ $id ] === wp_unslash( $data['post_title'] ) ) ) {
+				return $data;
+			}
+			$title = (string) get_post_meta( $id, self::EDITORIAL_TITLE_META, true );
+			if ( '' !== $title ) {
+				$data['post_title'] = wp_slash( $title );
+			}
+			return $data;
+		}
+
+		public static function remember_manual_product_title( $post_id, $post, $update, $post_before ) {
+			if ( ! $post instanceof WP_Post || 'product' !== $post->post_type || in_array( $post->post_status, array( 'auto-draft', 'trash' ), true ) || '' === trim( $post->post_title ) || ! self::is_manual_title_edit( $post_id ) ) {
+				return;
+			}
+			if ( ! $update || ! $post_before || $post_before->post_title !== $post->post_title ) {
+				update_post_meta( $post_id, self::EDITORIAL_TITLE_META, wp_slash( $post->post_title ) );
+			}
+		}
+
+		public static function remember_admin_product_name( $product ) {
+			if ( ! $product instanceof WC_Product || $product->is_type( 'variation' ) || ! self::is_manual_title_edit( $product->get_id() ) ) {
+				return;
+			}
+			$title = (string) $product->get_name( 'edit' );
+			$before = get_post( $product->get_id() );
+			if ( '' !== trim( $title ) && $before && ( $before->post_title !== $title || '' !== (string) get_post_meta( $product->get_id(), self::EDITORIAL_TITLE_META, true ) ) ) {
+				$product->update_meta_data( self::EDITORIAL_TITLE_META, $title );
+			}
+		}
+
+		public static function clear_editorial_title_update( $product ) {
+			if ( $product instanceof WC_Product ) {
+				unset( self::$editorial_title_updates[ $product->get_id() ] );
+			}
+		}
+
+		public static function render_editorial_title_status() {
+			global $post;
+			if ( ! $post || 'product' !== $post->post_type ) {
+				return;
+			}
+			$title = (string) get_post_meta( $post->ID, self::EDITORIAL_TITLE_META, true );
+			echo '<p class="form-field"><strong>Titolo H1 Sivieri</strong><br>';
+			echo '' !== $title ? 'Protetto dalle sincronizzazioni. Puoi modificarlo normalmente dal campo nome prodotto.' : 'La protezione si attiva alla prossima modifica manuale del nome prodotto.';
+			echo '<br>Disponibilità, quantità, prezzi e varianti continuano a sincronizzarsi.</p>';
+		}
+
+
 		private static function is_external_sync_request() {
 			$is_sync = false;
 
@@ -966,6 +1097,338 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 				delete_post_meta( $post->ID, self::NEW_PRODUCT_DRAFT_META );
 				delete_post_meta( $post->ID, self::NEW_PRODUCT_GUARDED_AT );
 			}
+		}
+
+		/* ---------------------------------------------------------------------
+		 * 1.5.0 — Stato unificato “Pubblicato · Esaurito”
+		 * ------------------------------------------------------------------ */
+
+		private static function is_published_outofstock_variable( $product ) {
+			return $product instanceof WC_Product
+				&& $product->is_type( 'variable' )
+				&& 'publish' === $product->get_status()
+				&& 'outofstock' === $product->get_stock_status();
+		}
+
+		private static function get_outofstock_price_range( $product_id ) {
+			$product_id = absint( $product_id );
+			if ( ! $product_id ) {
+				return array();
+			}
+
+			if ( isset( self::$outofstock_price_cache[ $product_id ] ) ) {
+				return self::$outofstock_price_cache[ $product_id ];
+			}
+
+			$variation_ids = get_posts(
+				array(
+					'post_type'      => 'product_variation',
+					'post_parent'    => $product_id,
+					'post_status'    => array( 'publish', 'private', 'trash' ),
+					'fields'         => 'ids',
+					'posts_per_page' => -1,
+					'orderby'        => 'ID',
+					'order'          => 'ASC',
+					'no_found_rows'  => true,
+				)
+			);
+
+			$prices = array();
+			foreach ( $variation_ids as $variation_id ) {
+				$value = get_post_meta( $variation_id, '_price', true );
+				if ( '' === $value || (float) $value <= 0 ) {
+					$value = get_post_meta( $variation_id, '_regular_price', true );
+				}
+
+				if ( '' === $value ) {
+					continue;
+				}
+
+				$value = (float) wc_format_decimal( $value );
+				if ( $value > 0 ) {
+					$prices[] = $value;
+				}
+			}
+
+			if ( empty( $prices ) ) {
+				self::$outofstock_price_cache[ $product_id ] = array();
+				return self::$outofstock_price_cache[ $product_id ];
+			}
+
+			self::$outofstock_price_cache[ $product_id ] = array(
+				'min' => min( $prices ),
+				'max' => max( $prices ),
+			);
+
+			return self::$outofstock_price_cache[ $product_id ];
+		}
+
+		public static function filter_outofstock_parent_price( $price, $product ) {
+			if ( ! self::is_published_outofstock_variable( $product ) ) {
+				return $price;
+			}
+
+			if ( '' !== (string) $price && (float) $price > 0 ) {
+				return $price;
+			}
+
+			$range = self::get_outofstock_price_range( $product->get_id() );
+			return isset( $range['min'] ) ? (string) $range['min'] : $price;
+		}
+
+		public static function filter_outofstock_price_html( $html, $product ) {
+			if ( ! self::is_published_outofstock_variable( $product ) ) {
+				return $html;
+			}
+
+			$range = self::get_outofstock_price_range( $product->get_id() );
+			if ( empty( $range['min'] ) ) {
+				return $html;
+			}
+
+			if ( ! empty( $range['max'] ) && (float) $range['max'] > (float) $range['min'] ) {
+				return wc_format_price_range( $range['min'], $range['max'] );
+			}
+
+			return wc_price( $range['min'] );
+		}
+
+		private static function format_outofstock_price_text( $range ) {
+			if ( empty( $range['min'] ) ) {
+				return '';
+			}
+
+			$min = wp_strip_all_tags( wc_price( $range['min'] ) );
+			if ( ! empty( $range['max'] ) && (float) $range['max'] > (float) $range['min'] ) {
+				$max = wp_strip_all_tags( wc_price( $range['max'] ) );
+				return $min . ' - ' . $max;
+			}
+
+			return $min;
+		}
+
+		public static function filter_rank_math_slack_enhanced_data( $data ) {
+			if ( ! is_array( $data ) || ! function_exists( 'is_product' ) || ! is_product() ) {
+				return $data;
+			}
+
+			$product_id = get_queried_object_id();
+			$product    = $product_id ? wc_get_product( $product_id ) : null;
+
+			if ( ! self::is_published_outofstock_variable( $product ) ) {
+				return $data;
+			}
+
+			$range = self::get_outofstock_price_range( $product_id );
+			$price = self::format_outofstock_price_text( $range );
+
+			if ( '' === $price ) {
+				return $data;
+			}
+
+			$replaced = false;
+			foreach ( array_keys( $data ) as $key ) {
+				$normalized = sanitize_title( wp_strip_all_tags( (string) $key ) );
+				if ( in_array( $normalized, array( 'price', 'prezzo' ), true ) ) {
+					$data[ $key ] = $price;
+					$replaced     = true;
+				}
+			}
+
+			if ( ! $replaced ) {
+				$price_label          = __( 'Price', 'seo-by-rank-math' );
+				$data[ $price_label ] = $price;
+			}
+
+			return $data;
+		}
+
+		public static function filter_saswp_outofstock_schema( $schema_output ) {
+			if ( ! is_array( $schema_output ) || ! function_exists( 'is_product' ) || ! is_product() ) {
+				return $schema_output;
+			}
+
+			$product_id = get_queried_object_id();
+			$product    = $product_id ? wc_get_product( $product_id ) : null;
+
+			// 1.6.2: normalize the existing offer for simple WooCommerce products.
+			if ( $product instanceof WC_Product && $product->is_type( 'simple' ) ) {
+				$statuses = array(
+					'instock' => 'https://schema.org/InStock',
+					'outofstock' => 'https://schema.org/OutOfStock',
+					'onbackorder' => 'https://schema.org/BackOrder',
+				);
+				$status = $product->get_stock_status();
+				$availability = isset( $statuses[ $status ] ) ? $statuses[ $status ] : 'https://schema.org/OutOfStock';
+				$url = get_permalink( $product_id );
+				$settings = get_option( 'sd_data', array() );
+				$seller = array(
+					'@type' => 'Organization',
+					'@id' => untrailingslashit( home_url() ) . '#Organization',
+					'name' => get_bloginfo( 'name' ),
+					'url' => home_url( '/' ),
+				);
+				if ( ! empty( $settings['sd_logo']['url'] ) ) {
+					$seller['logo'] = array( '@type' => 'ImageObject', 'url' => esc_url_raw( $settings['sd_logo']['url'] ) );
+				}
+				$normalize_simple = function ( &$node ) use ( &$normalize_simple, $url, $availability, $seller ) {
+					if ( ! is_array( $node ) ) {
+						return;
+					}
+					if ( isset( $node['@type'], $node['url'], $node['offers']['price'] )
+						&& in_array( 'Product', (array) $node['@type'], true )
+						&& untrailingslashit( $node['url'] ) === untrailingslashit( $url ) ) {
+						$node['offers']['@type'] = 'Offer';
+						$node['offers']['availability'] = $availability;
+						$node['offers']['seller'] = $seller;
+					}
+					foreach ( $node as &$value ) {
+						if ( is_array( $value ) ) {
+							$normalize_simple( $value );
+						}
+					}
+					unset( $value );
+				};
+				$normalize_simple( $schema_output );
+				return $schema_output;
+			}
+
+			if ( ! self::is_published_outofstock_variable( $product ) ) {
+				return $schema_output;
+			}
+
+			$range = self::get_outofstock_price_range( $product_id );
+			if ( empty( $range['min'] ) ) {
+				return $schema_output;
+			}
+
+			$price = (string) wc_format_decimal( $range['min'], wc_get_price_decimals() );
+			$url   = get_permalink( $product_id );
+
+			$walk = function ( &$node ) use ( &$walk, $price, $url ) {
+				if ( ! is_array( $node ) ) {
+					return;
+				}
+
+				if ( isset( $node['@type'] ) && 'ProductGroup' === $node['@type'] && isset( $node['offers'] ) && is_array( $node['offers'] ) ) {
+					$node['offers']['@type']         = 'Offer';
+					$node['offers']['price']         = $price;
+					$node['offers']['priceCurrency'] = get_woocommerce_currency();
+					$node['offers']['availability']  = 'https://schema.org/OutOfStock';
+					$node['offers']['url']           = $url;
+				}
+
+				foreach ( $node as &$value ) {
+					if ( is_array( $value ) ) {
+						$walk( $value );
+					}
+				}
+				unset( $value );
+			};
+
+			$walk( $schema_output );
+			return $schema_output;
+		}
+
+		public static function queue_trashed_variation_restore( $new_status, $old_status, $post ) {
+			if (
+				'trash' !== $new_status
+				|| 'trash' === $old_status
+				|| ! $post instanceof WP_Post
+				|| 'product_variation' !== $post->post_type
+			) {
+				return;
+			}
+
+			self::$trashed_variation_restore_queue[ absint( $post->ID ) ] = true;
+		}
+
+		public static function restore_protected_trashed_variations() {
+			if ( empty( self::$trashed_variation_restore_queue ) ) {
+				return;
+			}
+
+			$variation_ids = array_keys( self::$trashed_variation_restore_queue );
+			self::$trashed_variation_restore_queue = array();
+
+			foreach ( $variation_ids as $variation_id ) {
+				$variation_id = absint( $variation_id );
+				$post = get_post( $variation_id );
+				if ( ! $post || 'product_variation' !== $post->post_type || 'trash' !== $post->post_status ) {
+					continue;
+				}
+
+				$parent_id = absint( $post->post_parent );
+				$parent = wc_get_product( $parent_id );
+				if ( ! $parent instanceof WC_Product || 'publish' !== get_post_status( $parent_id ) ) {
+					continue;
+				}
+
+				$parent_mode = self::get_product_mode( $parent );
+				if ( in_array( $parent_mode, array( 'exclude', 'force_draft' ), true ) || self::is_discontinued_product( $parent_id ) ) {
+					continue;
+				}
+
+				$stock_status = (string) get_post_meta( $variation_id, '_stock_status', true );
+				if ( 'outofstock' !== $stock_status ) {
+					continue;
+				}
+
+				wp_untrash_post( $variation_id );
+				self::set_post_status_if_needed( $variation_id, 'private' );
+				clean_post_cache( $variation_id );
+				wc_delete_product_transients( $parent_id );
+				self::queue_product_update( $parent_id );
+			}
+		}
+
+		public static function add_published_outofstock_post_state( $states, $post ) {
+			if ( ! $post instanceof WP_Post || 'product' !== $post->post_type || 'publish' !== $post->post_status ) {
+				return $states;
+			}
+
+			$product = wc_get_product( $post->ID );
+			if ( $product instanceof WC_Product && ! $product->is_in_stock() ) {
+				$states['sivieri_published_outofstock'] = 'Pubblicato · Esaurito';
+			}
+
+			return $states;
+		}
+
+		public static function render_published_outofstock_filter( $post_type ) {
+			if ( 'product' !== $post_type ) {
+				return;
+			}
+
+			$selected = isset( $_GET['sivieri_stock_view'] ) ? sanitize_text_field( wp_unslash( $_GET['sivieri_stock_view'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			echo '<select name="sivieri_stock_view">';
+			echo '<option value="">Tutti gli stati disponibilità</option>';
+			echo '<option value="published_outofstock"' . selected( $selected, 'published_outofstock', false ) . '>Pubblicati esauriti</option>';
+			echo '</select>';
+		}
+
+		public static function apply_published_outofstock_filter( $query ) {
+			if ( ! is_admin() || ! $query->is_main_query() ) {
+				return;
+			}
+
+			global $pagenow;
+			if ( 'edit.php' !== $pagenow || 'product' !== $query->get( 'post_type' ) ) {
+				return;
+			}
+
+			$view = isset( $_GET['sivieri_stock_view'] ) ? sanitize_text_field( wp_unslash( $_GET['sivieri_stock_view'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			if ( 'published_outofstock' !== $view ) {
+				return;
+			}
+
+			$query->set( 'post_status', 'publish' );
+			$meta_query = (array) $query->get( 'meta_query' );
+			$meta_query[] = array(
+				'key'   => '_stock_status',
+				'value' => 'outofstock',
+			);
+			$query->set( 'meta_query', $meta_query );
 		}
 
 		private static function set_post_status_if_needed( $post_id, $status ) {
