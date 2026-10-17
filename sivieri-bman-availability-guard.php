@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Sivieri BMAN Availability Guard
  * Description: Gestione leggera della visibilità prodotti/varianti WooCommerce dopo sincronizzazione BMAN. Nasconde automaticamente varianti esaurite, propone una combinazione valida e aggiorna le informazioni d'acquisto in tempo reale.
- * Version: 1.6.2
+ * Version: 1.7.0
  * Author: Sivieri Prestige
  * Requires Plugins: woocommerce
  * Text Domain: sivieri-bman-availability-guard
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 	final class SP_BMAN_Availability_Guard {
 
-		const VERSION = '1.6.2';
+		const VERSION = '1.7.0';
 
 		const EDITORIAL_TITLE_META = '_spbag_editorial_title';
 		private static $editorial_title_updates = array();
@@ -62,6 +62,7 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 			}
 
 			self::maybe_schedule_events();
+			SP_BMAN_Sync_Recovery::boot();
 
 			// 1.3.0 — intercetta i NUOVI prodotti padre prima della prima pubblicazione.
 			// WooCommerce REST (caso tipico BMAN) + rete di sicurezza WordPress.
@@ -228,6 +229,8 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 					<li><strong>Nascondi manualmente / Escludi:</strong> la regola viene salvata anche per SKU, così BMAN non la annulla alla sincronizzazione successiva.</li>
 					<li><strong>Nuovi prodotti BMAN:</strong> un nuovo prodotto padre creato dalla sincronizzazione nasce direttamente in <strong>bozza</strong>, senza passare da pubblicato e senza fissare lo slug definitivo. Le nuove varianti di prodotti già esistenti non vengono bloccate.</li>
 				</ul>
+
+				<?php SP_BMAN_Sync_Recovery::render_admin_report(); ?>
 
 				<h2>Esauriti da verificare</h2>
 				<p>
@@ -1038,7 +1041,10 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 			// Prodotto già protetto: una sincronizzazione successiva non può pubblicarlo.
 			if ( $update && $post_id && self::is_guarded_new_product( $post_id ) && self::is_external_sync_request() ) {
 				$data['post_status'] = 'draft';
-				$data['post_name']   = '';
+				// A recovered historical draft keeps its original slug. Brand-new drafts do not fix one.
+				if ( '' === (string) get_post_meta( $post_id, SP_BMAN_Sync_Recovery::RECOVERED_META, true ) ) {
+					$data['post_name'] = '';
+				}
 				return $data;
 			}
 
@@ -2628,7 +2634,350 @@ if ( ! class_exists( 'SP_BMAN_Availability_Guard' ) ) {
 	}
 }
 
+/** BMAN-only recovery of interrupted/repeated WooCommerce creates. */
+final class SP_BMAN_Sync_Recovery {
+	const LOG_OPTION = 'spbag_sync_recovery_log';
+	const RECOVERED_META = '_spbag_bman_recovered_from_trash';
+	private static $key_id = 0;
+	private static $key_user_id = 0;
+	private static $locks = array();
+	private static $restoring_id = 0;
+
+	public static function boot() {
+		add_filter( 'woocommerce_disable_rest_api_access_log', array( __CLASS__, 'capture_authenticated_key' ), 10, 3 );
+		add_filter( 'rest_dispatch_request', array( __CLASS__, 'recover_create' ), 20, 4 );
+		add_filter( 'rest_request_after_callbacks', array( __CLASS__, 'finish_request' ), 99, 3 );
+		add_action( 'shutdown', array( __CLASS__, 'release_all_locks' ), 1000 );
+	}
+
+	/** WooCommerce calls this only after authentication and key permission checks. */
+	public static function capture_authenticated_key( $disabled, $key_id, $user_id ) {
+		self::$key_id = (int) $key_id;
+		self::$key_user_id = (int) $user_id;
+		return $disabled;
+	}
+
+	private static function is_bman() {
+		global $wpdb;
+		if ( ! self::$key_id || self::$key_user_id !== get_current_user_id() || ! current_user_can( 'manage_woocommerce' ) ) {
+			return false;
+		}
+		$key = $wpdb->get_row( $wpdb->prepare( "SELECT description, permissions, user_id FROM {$wpdb->prefix}woocommerce_api_keys WHERE key_id = %d", self::$key_id ) );
+		return $key && (int) $key->user_id === self::$key_user_id && 'BMAN' === strtoupper( trim( $key->description ) ) && 'read_write' === $key->permissions;
+	}
+
+	/** Runs after WordPress has validated the request and checked the native permissions. */
+	public static function recover_create( $result, $request, $route, $handler ) {
+		if ( null !== $result || 'POST' !== $request->get_method() || ! preg_match( '~^/wc/v3/products(?:/([0-9]+)/variations)?/?$~D', $request->get_route(), $match ) || ! self::is_bman() ) {
+			return $result;
+		}
+		$sku = $request->get_param( 'sku' );
+		if ( ! is_string( $sku ) || '' === trim( $sku ) ) {
+			return $result;
+		}
+		$sku = trim( $sku );
+		$parent_id = isset( $match[1] ) ? (int) $match[1] : 0;
+		if ( $parent_id && ( ! current_user_can( 'edit_post', $parent_id ) || 'product' !== get_post_type( $parent_id ) || 'trash' === get_post_status( $parent_id ) ) ) {
+			return self::failure( 'parent_unavailable', 'Il prodotto padre deve essere recuperato prima della variante.', $sku );
+		}
+		$lock_names = array( 'sku:' . strtolower( $sku ) );
+		if ( $parent_id ) {
+			$lock_names[] = 'parent:' . $parent_id;
+		}
+		sort( $lock_names );
+		foreach ( $lock_names as $name ) {
+			if ( ! self::acquire_lock( $request, $name ) ) {
+				self::release_request( $request );
+				return self::failure( 'sync_busy', 'Un altro invio dello stesso prodotto è in corso. Ripetere la sincronizzazione.', $sku );
+			}
+		}
+
+		global $wpdb;
+		// Post meta is authoritative. Include trash/private records, unlike the normal SKU lookup.
+		$owners = $wpdb->get_col( $wpdb->prepare( "SELECT DISTINCT p.ID FROM {$wpdb->posts} p INNER JOIN {$wpdb->postmeta} m ON m.post_id = p.ID WHERE p.post_type IN ('product','product_variation') AND m.meta_key = '_sku' AND m.meta_value = %s LIMIT 3", $sku ) );
+		if ( count( $owners ) > 1 ) {
+			return self::failure( 'ambiguous_sku', 'Lo SKU è associato a più schede: serve una verifica prima di sincronizzare.', $sku );
+		}
+		$owner_id = $owners ? (int) $owners[0] : 0;
+		$lookup = $wpdb->get_results( $wpdb->prepare( "SELECT l.product_id, p.ID AS live_id FROM {$wpdb->wc_product_meta_lookup} l LEFT JOIN {$wpdb->posts} p ON p.ID = l.product_id WHERE l.sku = %s", $sku ) );
+		foreach ( $lookup as $row ) {
+			if ( $row->live_id && (int) $row->live_id !== $owner_id ) {
+				return self::failure( 'lookup_mismatch', 'L’indice SKU indica una scheda diversa dai dati del prodotto: serve una verifica.', $sku, (int) $row->live_id );
+			}
+		}
+		if ( ! $owner_id ) {
+			if ( $parent_id && self::has_matching_variation( $parent_id, $request ) ) {
+				return self::failure( 'variation_sku_changed', 'Esiste già questa combinazione colore/taglia con un altro codice: verificare il collegamento.', $sku, $parent_id );
+			}
+			// Delete only an index row for THIS SKU whose post no longer exists, atomically.
+			if ( $lookup ) {
+				$removed = $wpdb->query( $wpdb->prepare( "DELETE l FROM {$wpdb->wc_product_meta_lookup} l LEFT JOIN {$wpdb->posts} p ON p.ID = l.product_id WHERE l.sku = %s AND p.ID IS NULL", $sku ) );
+				if ( false === $removed ) {
+					return self::failure( 'lookup_cleanup_failed', 'Impossibile riparare l’indice SKU. Ripetere dopo la verifica tecnica.', $sku );
+				}
+				if ( $removed ) {
+					self::record( 'indice_residuo_riparato', $sku, 0, 'Rimosse ' . (int) $removed . ' righe senza prodotto.' );
+				}
+			}
+			return $result; // Native create: the Availability Guard still keeps the new parent in draft.
+		}
+		return self::reuse_product( $owner_id, $parent_id, $sku, $request, $handler );
+	}
+
+	private static function explicit_params( $request ) {
+		return array_merge( $request->get_query_params(), $request->get_body_params(), (array) $request->get_json_params() );
+	}
+
+	private static function attribute_map( $attributes ) {
+		$map = array();
+		foreach ( (array) $attributes as $attribute ) {
+			if ( ! is_array( $attribute ) ) {
+				continue;
+			}
+			$name = ! empty( $attribute['id'] ) ? wc_attribute_taxonomy_name_by_id( (int) $attribute['id'] ) : ( $attribute['name'] ?? '' );
+			if ( ! $name || ! isset( $attribute['option'] ) || '' === (string) $attribute['option'] ) {
+				continue;
+			}
+			$map[ sanitize_title( str_replace( 'pa_', '', $name ) ) ] = sanitize_title( $attribute['option'] );
+		}
+		ksort( $map );
+		return $map;
+	}
+
+	private static function has_matching_variation( $parent_id, $request ) {
+		global $wpdb;
+		$wanted = self::attribute_map( $request->get_param( 'attributes' ) );
+		if ( ! $wanted ) {
+			return false;
+		}
+		$ids = $wpdb->get_col( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE post_parent = %d AND post_type = 'product_variation' AND post_status IN ('publish','private','draft','pending','trash')", $parent_id ) );
+		foreach ( $ids as $id ) {
+			$child = wc_get_product( $id );
+			$actual = array();
+			if ( ! $child instanceof WC_Product_Variation ) {
+				continue;
+			}
+			foreach ( $child->get_attributes() as $name => $value ) {
+				$actual[] = array( 'name' => $name, 'option' => $value );
+			}
+			if ( $wanted === self::attribute_map( $actual ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Preserve all editorial fields; merge only options of existing parent attributes. */
+	public static function recovery_payload( $incoming, $existing, $variation ) {
+		$allowed = array( 'regular_price', 'sale_price', 'date_on_sale_from', 'date_on_sale_from_gmt', 'date_on_sale_to', 'date_on_sale_to_gmt', 'tax_status', 'tax_class', 'manage_stock', 'stock_quantity', 'stock_status', 'backorders' );
+		$payload = array_intersect_key( $incoming, array_flip( $allowed ) );
+		$payload['status'] = 'trash' === $existing['status'] ? ( $variation ? 'private' : 'draft' ) : $existing['status'];
+		if ( $variation && ! empty( $incoming['attributes'] ) && self::attribute_map( $incoming['attributes'] ) !== self::attribute_map( $existing['attributes'] ) ) {
+			return new WP_Error( 'spbag_variation_attributes_changed', 'Lo SKU della variante corrisponde a una combinazione colore/taglia diversa.', array( 'status' => 409 ) );
+		}
+		if ( ! $variation && ! empty( $incoming['attributes'] ) ) {
+			$attributes = $existing['attributes'];
+			foreach ( $incoming['attributes'] as $added ) {
+				$found = false;
+				foreach ( $attributes as &$saved ) {
+					$same = ! empty( $saved['id'] ) && ! empty( $added['id'] ) ? (int) $saved['id'] === (int) $added['id'] : sanitize_title( $saved['name'] ) === sanitize_title( $added['name'] ?? '' );
+					if ( $same ) {
+						$saved['options'] = array_values( array_unique( array_merge( $saved['options'], (array) ( $added['options'] ?? array() ) ) ) );
+						$found = true;
+						break;
+					}
+				}
+				unset( $saved );
+				if ( ! $found ) {
+					return new WP_Error( 'spbag_attribute_structure_changed', 'La scheda esistente usa attributi diversi: verificare prima di ricollegare Bman.', array( 'status' => 409 ) );
+				}
+			}
+			$payload['attributes'] = $attributes;
+		}
+		return $payload;
+	}
+
+	private static function reuse_product( $id, $parent_id, $sku, $request, $handler ) {
+		$product = wc_get_product( $id );
+		$variation = $parent_id > 0;
+		if ( ! $product || ! current_user_can( 'edit_post', $id ) ) {
+			return self::failure( 'cannot_recover', 'La scheda esistente non può essere aggiornata da questa connessione.', $sku, $id );
+		}
+		if ( ! in_array( get_post_status( $id ), array( 'publish', 'private', 'draft', 'pending', 'trash' ), true ) ) {
+			return self::failure( 'incomplete_product', 'La scheda è ancora in creazione: ripetere la sincronizzazione.', $sku, $id );
+		}
+		if ( $variation !== ( $product instanceof WC_Product_Variation ) || ( $variation && $parent_id !== (int) $product->get_parent_id() ) ) {
+			return self::failure( 'wrong_product', 'Lo SKU appartiene a un altro prodotto o a una variante di un altro padre.', $sku, $id );
+		}
+		$params = self::explicit_params( $request );
+		if ( ! $variation && isset( $params['type'] ) && $params['type'] !== $product->get_type() ) {
+			return self::failure( 'product_type_changed', 'Il tipo di prodotto Bman è diverso dalla scheda esistente: verificare il collegamento.', $sku, $id );
+		}
+		$controller = $handler['callback'][0] ?? null;
+		$native_controller = $variation ? $controller instanceof WC_REST_Product_Variations_Controller : $controller instanceof WC_REST_Products_Controller;
+		if ( ! $native_controller || ! is_callable( array( $controller, 'update_item_permissions_check' ) ) ) {
+			return self::failure( 'unsupported_controller', 'Il controller WooCommerce non supporta il recupero sicuro.', $sku, $id );
+		}
+		$base = $variation ? '/wc/v3/products/' . $parent_id . '/variations/' : '/wc/v3/products/';
+		$update = new WP_REST_Request( 'PUT', $base . $id );
+		$update->set_url_params( $variation ? array( 'id' => $id, 'product_id' => $parent_id ) : array( 'id' => $id ) );
+		$permission = $controller->update_item_permissions_check( $update );
+		if ( is_wp_error( $permission ) || true !== $permission ) {
+			return is_wp_error( $permission ) ? $permission : self::failure( 'update_forbidden', 'La connessione non può aggiornare la scheda esistente.', $sku, $id );
+		}
+		$read = new WP_REST_Request( 'GET', $base . $id );
+		$read->set_param( 'context', 'edit' );
+		$old = rest_do_request( $read );
+		if ( $old->is_error() ) {
+			return $old;
+		}
+		$data = $old->get_data();
+		$payload = self::recovery_payload( $params, $data, $variation );
+		if ( is_wp_error( $payload ) ) {
+			self::record( 'verifica_necessaria', $sku, $id, $payload->get_error_message() );
+			return $payload;
+		}
+		$was_trashed = 'trash' === get_post_status( $id );
+		if ( $was_trashed ) {
+			// Native untrash restores the original slug. Recovered parents always await manual review.
+			if ( ! $variation ) {
+				global $wpdb;
+				$desired_slug = (string) get_post_meta( $id, '_wp_desired_post_slug', true );
+				if ( ! $desired_slug ) {
+					$desired_slug = (string) $data['slug'];
+					if ( preg_match( '/__trashed(?:-[0-9]+)?$/', $desired_slug ) ) {
+						return self::failure( 'original_slug_unknown', 'Manca lo slug originale della scheda cestinata: verificare l’URL prima del recupero.', $sku, $id );
+					}
+				}
+				$slug_owner = $desired_slug ? $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM {$wpdb->posts} WHERE post_type = 'product' AND post_status <> 'trash' AND ID <> %d AND post_name = %s LIMIT 1", $id, $desired_slug ) ) : 0;
+				if ( $slug_owner ) {
+					return self::failure( 'slug_conflict', 'L’URL originale è già usato da un’altra scheda: verificare prima del recupero.', $sku, $id );
+				}
+			}
+			self::$restoring_id = $id;
+			add_filter( 'wp_untrash_post_status', array( __CLASS__, 'review_status_on_untrash' ), PHP_INT_MAX, 2 );
+			try {
+				$restored = wp_untrash_post( $id );
+			} finally {
+				remove_filter( 'wp_untrash_post_status', array( __CLASS__, 'review_status_on_untrash' ), PHP_INT_MAX );
+				self::$restoring_id = 0;
+			}
+			if ( ! $restored || 'trash' === get_post_status( $id ) ) {
+				return self::failure( 'untrash_failed', 'Impossibile recuperare la scheda dal cestino.', $sku, $id );
+			}
+			if ( ! $variation ) {
+				update_post_meta( $id, self::RECOVERED_META, current_time( 'mysql' ) );
+				update_post_meta( $id, SP_BMAN_Availability_Guard::NEW_PRODUCT_DRAFT_META, '1' );
+				update_post_meta( $id, SP_BMAN_Availability_Guard::NEW_PRODUCT_GUARDED_AT, current_time( 'mysql' ) );
+			}
+		}
+		$update->set_header( 'content-type', 'application/json' );
+		$update->set_body( wp_json_encode( $payload ) );
+		$response = rest_do_request( $update );
+		if ( $response->is_error() ) {
+			// A failed recovery never leaves a previously trashed item publicly visible.
+			if ( $was_trashed ) {
+				wp_trash_post( $id );
+			}
+			self::record( 'verifica_necessaria', $sku, $id, 'Aggiornamento WooCommerce non riuscito.' );
+			return $response;
+		}
+		$response->set_status( 201 ); // BMAN issued a create: return the existing object's ID as a create response.
+		$response->header( 'Location', rest_url( $base . $id ) );
+		$response->header( 'X-Sivieri-Bman-Recovery', $was_trashed ? 'trash-to-review' : 'existing-product' );
+		self::record( $was_trashed ? 'recuperato_dal_cestino' : 'ricollegato_esistente', $sku, $id, $was_trashed ? 'Scheda recuperata per verifica; URL conservato.' : 'Stesso ID, URL e contenuti; dati gestionali aggiornati.' );
+		return $response;
+	}
+
+	public static function review_status_on_untrash( $status, $id ) {
+		if ( (int) $id !== self::$restoring_id ) {
+			return $status;
+		}
+		return 'product_variation' === get_post_type( $id ) ? 'private' : 'draft';
+	}
+
+	/** Non-blocking option lock: no waiting/locking SQL functions or global catalog scans. */
+	private static function acquire_lock( $request, $name ) {
+		global $wpdb;
+		$key = 'spbag_sync_lock_' . hash( 'sha256', $name );
+		$value = array( 'token' => wp_generate_uuid4(), 'expires' => time() + 300 );
+		if ( ! add_option( $key, $value, '', false ) ) {
+			$old = get_option( $key );
+			if ( ! is_array( $old ) || empty( $old['expires'] ) || $old['expires'] >= time() ) {
+				return false;
+			}
+			$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", $key, maybe_serialize( $old ) ) );
+			wp_cache_delete( $key, 'options' );
+			if ( ! add_option( $key, $value, '', false ) ) {
+				return false;
+			}
+		}
+		self::$locks[ spl_object_id( $request ) ][ $key ] = $value;
+		return true;
+	}
+
+	private static function release_request( $request ) {
+		global $wpdb;
+		$index = spl_object_id( $request );
+		foreach ( self::$locks[ $index ] ?? array() as $key => $value ) {
+			$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", $key, maybe_serialize( $value ) ) );
+			wp_cache_delete( $key, 'options' );
+		}
+		unset( self::$locks[ $index ] );
+	}
+
+	public static function finish_request( $response, $handler, $request ) {
+		self::release_request( $request );
+		return $response;
+	}
+
+	public static function release_all_locks() {
+		global $wpdb;
+		foreach ( self::$locks as $locks ) {
+			foreach ( $locks as $key => $value ) {
+				$wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s", $key, maybe_serialize( $value ) ) );
+				wp_cache_delete( $key, 'options' );
+			}
+		}
+		self::$locks = array();
+	}
+
+	private static function failure( $code, $message, $sku, $id = 0 ) {
+		self::record( 'verifica_necessaria', $sku, $id, $message );
+		return new WP_Error( 'spbag_' . $code, $message, array( 'status' => 409 ) );
+	}
+
+	private static function record( $event, $sku, $id, $note ) {
+		$log = get_option( self::LOG_OPTION, array() );
+		$log = is_array( $log ) ? $log : array();
+		$log[] = array( 'time' => current_time( 'mysql' ), 'event' => $event, 'sku' => $sku, 'id' => (int) $id, 'note' => $note );
+		update_option( self::LOG_OPTION, array_slice( $log, -50 ), false );
+	}
+
+	public static function render_admin_report() {
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			return;
+		}
+		echo '<h2>Recupero sincronizzazioni Bman</h2><p><strong>Attivo per la connessione API BMAN.</strong> Gli invii ripetuti riutilizzano la scheda e il suo URL. I prodotti recuperati dal cestino passano in Coda pubblicazione per verifica. Gli SKU residui vengono riparati solo durante l’invio del relativo articolo e solo se il prodotto non esiste più.</p>';
+		$log = get_option( self::LOG_OPTION, array() );
+		if ( ! is_array( $log ) || ! $log ) {
+			echo '<p>Nessun recupero o conflitto registrato.</p>';
+			return;
+		}
+		echo '<table class="widefat striped"><thead><tr><th>Data</th><th>SKU</th><th>Esito</th><th>Scheda</th><th>Dettaglio</th></tr></thead><tbody>';
+		foreach ( array_reverse( $log ) as $entry ) {
+			echo '<tr><td>' . esc_html( $entry['time'] ) . '</td><td>' . esc_html( $entry['sku'] ) . '</td><td>' . esc_html( str_replace( '_', ' ', $entry['event'] ) ) . '</td><td>';
+			if ( $entry['id'] && get_post( $entry['id'] ) ) {
+				echo '<a href="' . esc_url( get_edit_post_link( $entry['id'] ) ) . '">Apri #' . (int) $entry['id'] . '</a>';
+			}
+			echo '</td><td>' . esc_html( $entry['note'] ) . '</td></tr>';
+		}
+		echo '</tbody></table>';
+	}
+}
+
 SP_BMAN_Availability_Guard::init();
 
 register_activation_hook( __FILE__, array( 'SP_BMAN_Availability_Guard', 'activate' ) );
 register_deactivation_hook( __FILE__, array( 'SP_BMAN_Availability_Guard', 'deactivate' ) );
+
